@@ -1,14 +1,11 @@
 # server.py
-'''
-Enabling real GPT calls (optional):
-1. Install deps: pip install -r requirements.txt.
-2. Create a .env file with OPENAI_API_KEY=... .
-3. Replace call_gpt() in server.py with the real implementation shown in the comments, or keep the stub.
-'''
-import os
-from openai import OpenAI 
 import argparse, socket, json, time, threading, math, os, ast, operator, collections
 from typing import Any, Dict
+# ייבוא עבור GPT - נדרש אם אתה משתמש במימוש אמיתי
+try:
+    from openai import OpenAI
+except ImportError:
+    pass
 
 # ---------------- LRU Cache (simple) ----------------
 class LRUCache:
@@ -69,40 +66,46 @@ def safe_eval_expr(expr: str) -> float:
     tree = ast.parse(expr, mode="eval")
     return float(_eval_node(tree.body))
 
-#אצחול הסוכן
-client =  OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# ---------------- GPT Call (Stub or Real Implementation) ----------------
+# אתחול הלקוח של OpenAI פעם אחת (בצורה גלובלית ליעילות)
+try:
+    OPENAI_CLIENT = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+except Exception:
+    OPENAI_CLIENT = None
+    print("[SERVER] Warning: OpenAI client could not be initialized (API key missing or bad import). Using Stub.")
 
-# ---------------- GPT Call (stub by default) ----------------
+
 def call_gpt(prompt: str) -> str:
-    
     """
-    Stub for GPT call — returns a placeholder string.
-    Replace this with a real OpenAI call if desired.
+    Real implementation for GPT call using OpenAI API or Stub if client fails.
     """
+    if OPENAI_CLIENT is None:
+        # Stub/Fallback (כנדרש אם המפתח אינו זמין) [cite: 72]
+        return f"[GPT-STUB] Received a prompt of length {len(prompt)} chars. (API inactive)"
+
     try:
-        response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role":"system" , "content":"be a helpful assistent"},
-                    {"role": "user", "content": f"return the correct answer you think for: {prompt}"}
-                ]
-            )
+        response = OPENAI_CLIENT.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful and concise assistant."},
+                {"role": "user", "content": prompt}
+            ]
+        )
         return response.choices[0].message.content
-    
     except Exception as e:
-        # טיפול בשגיאות תקשורת או API
-        return f"[GPT-ERROR] Failed to get response: {e}"
-    
-    
+        return f"[GPT-ERROR] Failed to get response from API: {e}"
+
 # ---------------- Server core ----------------
 def handle_request(msg: Dict[str, Any], cache: LRUCache) -> Dict[str, Any]:
+    # ... (קוד handle_request נשאר זהה) ...
     mode = msg.get("mode")
     data = msg.get("data") or {}
     options = msg.get("options") or {}
     use_cache = bool(options.get("cache", True))
 
     started = time.time()
-    cache_key = json.dumps(msg, sort_keys=True)
+    # מייצרים מפתח מטמון מתוך ההודעה המלאה
+    cache_key = json.dumps(msg, sort_keys=True) 
 
     if use_cache:
         hit = cache.get(cache_key)
@@ -126,11 +129,14 @@ def handle_request(msg: Dict[str, Any], cache: LRUCache) -> Dict[str, Any]:
         took = int((time.time()-started)*1000)
         if use_cache:
             cache.set(cache_key, res)
+            
+        # הוספת ה-meta data של השרת
         return {"ok": True, "result": res, "meta": {"from_cache": False, "took_ms": took}}
     except Exception as e:
         return {"ok": False, "error": f"Server error: {e}"}
 
 def serve(host: str, port: int, cache_size: int):
+    # ... (קוד serve נשאר זהה) ...
     cache = LRUCache(cache_size)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -139,9 +145,11 @@ def serve(host: str, port: int, cache_size: int):
         print(f"[server] listening on {host}:{port} (cache={cache_size})")
         while True:
             conn, addr = s.accept()
+            # מפעיל תהליכון נפרד לטיפול בלקוח
             threading.Thread(target=handle_client, args=(conn, addr, cache), daemon=True).start()
 
 def handle_client(conn: socket.socket, addr, cache: LRUCache):
+    """ מטפל בלקוח יחיד ותומך בבקשות מרובות (Persistent Connection) """
     with conn:
         try:
             raw = b""
@@ -150,21 +158,33 @@ def handle_client(conn: socket.socket, addr, cache: LRUCache):
                 if not chunk:
                     break
                 raw += chunk
-                while "b\n" in raw:
+                
+                # לולאה פנימית לטיפול בבקשות מרובות שנשלחו ב-Pipe
+                while b"\n" in raw:
                     line, _, rest = raw.partition(b"\n")
                     raw = rest
+                    
+                    # 1. עיבוד
                     msg = json.loads(line.decode("utf-8"))
                     resp = handle_request(msg, cache)
+                    
+                    # 2. שליחה חזרה
                     out = (json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8")
                     conn.sendall(out)
+                
+                # אם ה-chunk ריק, יוצא מהלולאה החיצונית (Break)
+                if not chunk:
+                    break
+                    
         except Exception as e:
+            # במקרה של שגיאה (כמו JSON שגוי), ננסה לשלוח הודעת שגיאה ולסגור את החיבור
             try:
                 conn.sendall((json.dumps({"ok": False, "error": f"Malformed: {e}"} ) + "\n").encode("utf-8"))
             except Exception:
                 pass
 
 def main():
-    ap = argparse.ArgumentParser(description="JSON TCP server (calc/gpt) — student skeleton")
+    ap = argparse.ArgumentParser(description="JSON TCP server (calc/gpt) — supports Persistence and Caching")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5555)
     ap.add_argument("--cache-size", type=int, default=128)
